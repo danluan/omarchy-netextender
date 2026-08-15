@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "id": "danluan.netextender",
+  "name": "NetExtender VPN",
+  "version": "1.0.0",
+  "author": "Danluan",
+  "license": "MIT",
+  "description": "A secure SonicWall NetExtender control panel for Omarchy.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "NetExtender VPN",
+    "description": "Connect SonicWall NetExtender and monitor the active VPN session.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "server": "",
+      "username": "",
+      "domain": "",
+      "profiles": [],
+      "serverHistory": []
+    },
+    "schema": [
+      {
+        "key": "server",
+        "type": "string",
+        "label": "Server",
+        "defaultValue": ""
+      },
+      {
+        "key": "username",
+        "type": "string",
+        "label": "Username",
+        "defaultValue": ""
+      },
+      {
+        "key": "domain",
+        "type": "string",
+        "label": "Domain",
+        "defaultValue": ""
+      }
+    ]
+  }
+}

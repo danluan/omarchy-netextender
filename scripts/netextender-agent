@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""Private NetExtender bridge for the Omarchy widget.
+
+The client has no secure password-file/stdin argument.  This bridge uses a
+pseudo-terminal so NetExtender keeps its normal prompt flow while the password
+is read from Secret Service and never appears in argv, a log, or shell config.
+Its stdout is a line-delimited JSON protocol for the QML panel.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pty
+import re
+import select
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+APP = "danluan.netextender"
+PPP_PID = Path("/etc/ppp/netextenderppp.pid")
+CLIENT_PID = Path("/etc/ppp/netextender.pid")
+CLIENT_IP = Path("/etc/ppp/sslvpn.clientip")
+
+
+def event(kind: str, **values: object) -> None:
+    print(json.dumps({"event": kind, **values}, separators=(",", ":")), flush=True)
+
+
+def live_pid(path: Path) -> int | None:
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+        if not re.fullmatch(r"[1-9][0-9]*", raw):
+            return None
+        pid = int(raw)
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError):
+        return None
+
+
+def client_ip() -> str:
+    try:
+        value = CLIENT_IP.read_text(encoding="utf-8").strip()
+        return value if re.fullmatch(r"[0-9A-Fa-f:.]+", value) else ""
+    except OSError:
+        return ""
+
+
+def ppp_interface(ip: str) -> str:
+    interfaces = [entry.name for entry in sorted(Path("/sys/class/net").glob("ppp*"))]
+    for interface in interfaces:
+        try:
+            output = subprocess.run(
+                ["ip", "-o", "-4", "addr", "show", "dev", interface],
+                capture_output=True, text=True, check=False, timeout=2,
+            ).stdout
+            if ip and (ip + "/") in output:
+                return interface
+        except (OSError, subprocess.SubprocessError):
+            continue
+
+    # Some NetExtender releases leave sslvpn.clientip empty even after PPP is
+    # established. With one PPP interface, it is still unambiguous and its
+    # kernel counters are the session's sent/received traffic.
+    return interfaces[0] if len(interfaces) == 1 else ""
+
+
+def interface_counters(interface: str) -> tuple[int, int]:
+    if not interface:
+        return 0, 0
+    try:
+        root = Path("/sys/class/net") / interface / "statistics"
+        return (int((root / "tx_bytes").read_text()), int((root / "rx_bytes").read_text()))
+    except (OSError, ValueError):
+        return 0, 0
+
+
+def process_started_at(pid: int | None) -> int:
+    if not pid:
+        return 0
+    try:
+        start_ticks = int(Path(f"/proc/{pid}/stat").read_text().split()[21])
+        boot = next(int(line.split()[1]) for line in Path("/proc/stat").read_text().splitlines()
+                    if line.startswith("btime "))
+        hz = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
+        return boot + start_ticks // hz
+    except (OSError, ValueError, StopIteration, IndexError):
+        return 0
+
+
+def status() -> dict[str, object]:
+    ppp_pid = live_pid(PPP_PID)
+    ip = client_ip()
+    interface = ppp_interface(ip) if ppp_pid else ""
+    connected = bool(ppp_pid and interface)
+    sent, received = interface_counters(interface)
+    started = process_started_at(ppp_pid) if connected else 0
+    return {
+        "connected": connected,
+        "clientIp": ip if connected else "",
+        "interface": interface,
+        "sentBytes": sent,
+        "receivedBytes": received,
+        "connectedAt": started,
+        "durationSec": max(0, int(time.time()) - started) if started else 0,
+    }
+
+
+def attributes(args: argparse.Namespace) -> list[str]:
+    return ["application", APP, "server", args.server, "username", args.username, "domain", args.domain]
+
+
+def lookup_secret(args: argparse.Namespace) -> str:
+    result = subprocess.run(["secret-tool", "lookup", *attributes(args)], capture_output=True,
+                            text=True, check=False, timeout=15)
+    if result.returncode != 0 or not result.stdout:
+        return ""
+    return result.stdout.rstrip("\n")
+
+
+def store_secret(args: argparse.Namespace) -> int:
+    secret = sys.stdin.readline().rstrip("\n")
+    if not secret:
+        event("error", message="Password cannot be empty.")
+        return 2
+    label = f"NetExtender VPN — {args.username}@{args.server}"
+    result = subprocess.run(["secret-tool", "store", "--label", label, *attributes(args)], input=secret,
+                            text=True, check=False, timeout=30)
+    secret = ""
+    if result.returncode:
+        event("error", message="Could not save the password in the system keyring.")
+        return result.returncode
+    event("stored")
+    return 0
+
+
+def has_secret(args: argparse.Namespace) -> int:
+    secret = lookup_secret(args)
+    available = bool(secret)
+    secret = ""
+    event("credential", available=available)
+    return 0
+
+
+def disconnect() -> int:
+    pid = live_pid(CLIENT_PID)
+    if not pid:
+        event("disconnected")
+        return 0
+    try:
+        os.kill(pid, signal.SIGTERM)
+        event("disconnecting")
+        return 0
+    except OSError:
+        event("error", message="Could not stop the NetExtender process.")
+        return 1
+
+
+def connect(args: argparse.Namespace) -> int:
+    password = lookup_secret(args)
+    if not password:
+        event("error", message="No password is stored for this server and user.")
+        return 2
+    master, slave = pty.openpty()
+    command = ["netExtender", "-u", args.username, "-d", args.domain, args.server]
+    try:
+        proc = subprocess.Popen(command, stdin=slave, stdout=slave, stderr=slave, close_fds=True)
+    except OSError:
+        os.close(master)
+        os.close(slave)
+        event("error", message="NetExtender is not installed or could not be started.")
+        return 127
+    os.close(slave)
+    event("connecting")
+    transcript = ""
+    password_sent = False
+    awaiting_otp = False
+    otp_deadline = 0.0
+    input_open = True
+    try:
+        while proc.poll() is None:
+            readable, _, _ = select.select([master, sys.stdin] if input_open else [master], [], [], 0.25)
+            if master in readable:
+                try:
+                    data = os.read(master, 4096).decode(errors="replace")
+                except OSError:
+                    data = ""
+                transcript = (transcript + data)[-8192:]
+                lower = transcript.lower()
+                if not password_sent and "password:" in lower:
+                    os.write(master, (password + "\n").encode())
+                    password = ""
+                    password_sent = True
+                    transcript = ""
+                if (password_sent and not awaiting_otp and
+                    ("one time password:" in lower or "enter next token:" in lower or
+                     "additional verification" in lower)):
+                    awaiting_otp = True
+                    otp_deadline = time.monotonic() + 180
+                    event("needs_otp")
+                    transcript = ""
+                if "authentication failed" in lower or "otp authentication failed" in lower:
+                    event("error", message="Authentication failed. Check your details or verification code.")
+                    transcript = ""
+            if input_open and sys.stdin in readable:
+                code = sys.stdin.readline().strip()
+                if not code:
+                    input_open = False
+                elif awaiting_otp:
+                    os.write(master, (code + "\n").encode())
+                    awaiting_otp = False
+                    event("verifying_otp")
+            if awaiting_otp and time.monotonic() > otp_deadline:
+                event("error", message="The verification code timed out.")
+                proc.terminate()
+                break
+    finally:
+        password = ""
+        try:
+            os.close(master)
+        except OSError:
+            pass
+    code = proc.wait()
+    if code and not awaiting_otp:
+        event("ended", code=code)
+    return code
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("action", choices=("status", "disconnect", "store-secret", "has-secret", "connect"))
+    parser.add_argument("--server", default="")
+    parser.add_argument("--username", default="")
+    parser.add_argument("--domain", default="")
+    args = parser.parse_args()
+    if args.action in ("store-secret", "has-secret", "connect") and not all((args.server, args.username, args.domain)):
+        parser.error("server, username, and domain are required")
+    return args
+
+
+def main() -> int:
+    args = parse_args()
+    if args.action == "status":
+        print(json.dumps(status(), separators=(",", ":")))
+        return 0
+    if args.action == "disconnect":
+        return disconnect()
+    if args.action == "store-secret":
+        return store_secret(args)
+    if args.action == "has-secret":
+        return has_secret(args)
+    return connect(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

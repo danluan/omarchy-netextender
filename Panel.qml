@@ -12,7 +12,13 @@ Panel {
 
     property string connectionState: "Checking connection…"
     property string lastError: ""
+    property string lastWarning: ""
     property bool otpRequired: false
+    property bool certificateRequired: false
+    property bool certificateBusy: false
+    property bool connectionCancelled: false
+    property string certificateMessage: ""
+    property string certificateDetails: ""
     property bool savingSecret: false
     property bool credentialKnown: false
     property bool loadingSettings: false
@@ -183,6 +189,12 @@ Panel {
             return ;
 
         lastError = "";
+        lastWarning = "";
+        connectionCancelled = false;
+        certificateRequired = false;
+        certificateBusy = false;
+        certificateMessage = "";
+        certificateDetails = "";
         rememberServer(serverField.text);
         rememberProfile();
         updateSettings();
@@ -216,6 +228,37 @@ Panel {
         console.debug("NetExtender agent event: " + String(eventData.event || "unknown"));
         if (eventData.event === "connecting") {
             connectionState = "Connecting securely…";
+        } else if (eventData.event === "needs_certificate") {
+            certificateMessage = String(eventData.message || "The server certificate could not be verified.");
+            certificateDetails = "";
+            certificateBusy = false;
+            certificateRequired = true;
+            connectionState = "Certificate approval required";
+        } else if (eventData.event === "reading_certificate") {
+            certificateBusy = true;
+            connectionState = "Reading certificate…";
+        } else if (eventData.event === "certificate_details") {
+            certificateDetails = String(eventData.details || "Certificate details are unavailable.");
+            certificateBusy = false;
+            connectionState = "Certificate approval required";
+        } else if (eventData.event === "certificate_accepted") {
+            certificateRequired = false;
+            certificateBusy = false;
+            connectionState = "Connecting securely…";
+        } else if (eventData.event === "certificate_trusted") {
+            certificateRequired = false;
+            certificateBusy = false;
+            connectionState = "Connecting securely…";
+        } else if (eventData.event === "certificate_cancelled") {
+            certificateRequired = false;
+            certificateBusy = false;
+            connectionCancelled = true;
+            connectionState = "Connection cancelled";
+        } else if (eventData.event === "warning") {
+            certificateRequired = false;
+            certificateBusy = false;
+            lastWarning = String(eventData.message || "The connection continued with a warning.");
+            connectionState = "Connecting securely…";
         } else if (eventData.event === "needs_otp") {
             connectionState = "Verification code required";
             otpRequired = true;
@@ -230,6 +273,8 @@ Panel {
             setCredentialKnown(eventData.available === true);
         } else if (eventData.event === "error") {
             otpRequired = false;
+            certificateRequired = false;
+            certificateBusy = false;
             lastError = String(eventData.message || "Connection failed.");
             connectionState = "Connection failed";
         } else if (eventData.event === "ended" && !connected && lastError === "") {
@@ -239,6 +284,8 @@ Panel {
 
     function disconnect() {
         otpRequired = false;
+        certificateRequired = false;
+        certificateBusy = false;
         if (connectProcess.running)
             connectProcess.signal(15);
 
@@ -265,6 +312,26 @@ Panel {
         otpField.text = "";
         otpRequired = false;
         connectionState = "Verifying code…";
+    }
+
+    function submitCertificateDecision(decision) {
+        if (!certificateRequired || (certificateBusy && decision !== "cancel") || !connectProcess.running)
+            return ;
+
+        if (decision === "cancel") {
+            connectionCancelled = true;
+            connectionState = "Cancelling connection…";
+        } else if (decision === "view") {
+            certificateBusy = true;
+            connectionState = "Reading certificate…";
+        } else if (decision === "always") {
+            certificateBusy = true;
+            connectionState = "Saving certificate trust…";
+        } else {
+            certificateBusy = true;
+            connectionState = "Accepting certificate…";
+        }
+        connectProcess.write("cert:" + decision + "\n");
     }
 
     implicitWidth: button.implicitWidth
@@ -378,7 +445,9 @@ Panel {
         stdinEnabled: true
         onExited: function(exitCode) {
             otpRequired = false;
-            if (exitCode !== 0 && lastError === "")
+            certificateRequired = false;
+            certificateBusy = false;
+            if (exitCode !== 0 && lastError === "" && !connectionCancelled)
                 lastError = "NetExtender stopped before connecting.";
 
             refreshTimer.restart();
@@ -676,6 +745,16 @@ Panel {
                     wrapMode: Text.Wrap
                 }
 
+                Text {
+                    visible: root.lastWarning !== ""
+                    Layout.fillWidth: true
+                    text: root.lastWarning
+                    color: "#e5c07b"
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.bodySmall
+                    wrapMode: Text.Wrap
+                }
+
                 Item {
                     Layout.fillHeight: true
                     Layout.minimumHeight: Style.space(4)
@@ -729,6 +808,16 @@ Panel {
                     font.letterSpacing: 1.1
                 }
 
+                Text {
+                    visible: root.lastWarning !== ""
+                    Layout.fillWidth: true
+                    text: root.lastWarning
+                    color: "#e5c07b"
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.bodySmall
+                    wrapMode: Text.Wrap
+                }
+
                 SessionRow {
                     icon: "󰩟"
                     label: "Client IP"
@@ -777,6 +866,169 @@ Panel {
                         foreground: root.barForeground
                         bordered: true
                         onClicked: root.disconnect()
+                    }
+
+                }
+
+            }
+
+        }
+
+    }
+
+    PanelWindow {
+        id: certificateOverlay
+
+        screen: button.QsWindow.window ? button.QsWindow.window.screen : null
+        visible: root.certificateRequired
+        color: "transparent"
+        exclusionMode: ExclusionMode.Ignore
+        WlrLayershell.namespace: "local-netextender-certificate"
+        WlrLayershell.layer: WlrLayer.Overlay
+        WlrLayershell.keyboardFocus: root.certificateRequired ? WlrKeyboardFocus.Exclusive : WlrKeyboardFocus.None
+
+        anchors {
+            top: true
+            right: true
+            bottom: true
+            left: true
+        }
+
+        FocusScope {
+            anchors.fill: parent
+            focus: root.certificateRequired
+            Keys.onEscapePressed: root.submitCertificateDecision("cancel")
+
+            MouseArea {
+                anchors.fill: parent
+            }
+
+            BorderSurface {
+                id: certificateCard
+
+                width: Math.min(Style.space(660), certificateOverlay.width - Style.space(32))
+                height: Math.min(certificateContent.implicitHeight + Style.space(40), certificateOverlay.height - Style.space(32))
+                anchors.centerIn: parent
+                color: Color.popups.background
+                borderSpec: Border.controlSpec("focus", root.barForeground, root.bar ? root.bar.urgent : "#e06c75")
+                radius: Style.cornerRadius
+
+                ColumnLayout {
+                    id: certificateContent
+
+                    anchors.fill: parent
+                    anchors.margins: Style.space(20)
+                    spacing: Style.space(12)
+
+                    Text {
+                        Layout.alignment: Qt.AlignHCenter
+                        text: "󰒃"
+                        color: root.bar ? root.bar.urgent : "#e06c75"
+                        font.family: Style.font.family
+                        font.pixelSize: Style.space(34)
+                    }
+
+                    Text {
+                        Layout.alignment: Qt.AlignHCenter
+                        text: "Certificate verification warning"
+                        color: root.barForeground
+                        font.family: Style.font.family
+                        font.pixelSize: Style.font.title
+                        font.bold: true
+                    }
+
+                    Text {
+                        Layout.fillWidth: true
+                        text: "Information exchanged with this site is encrypted, but the server certificate could not be verified."
+                        color: root.dim
+                        font.family: Style.font.family
+                        font.pixelSize: Style.font.body
+                        wrapMode: Text.Wrap
+                        horizontalAlignment: Text.AlignHCenter
+                    }
+
+                    Text {
+                        Layout.fillWidth: true
+                        text: root.certificateMessage
+                        color: root.bar ? root.bar.urgent : "#e06c75"
+                        font.family: Style.font.family
+                        font.pixelSize: Style.font.body
+                        font.bold: true
+                        wrapMode: Text.Wrap
+                        horizontalAlignment: Text.AlignHCenter
+                    }
+
+                    Text {
+                        visible: root.certificateDetails === ""
+                        Layout.fillWidth: true
+                        text: "Do you want to proceed?"
+                        color: root.barForeground
+                        font.family: Style.font.family
+                        font.pixelSize: Style.font.body
+                        wrapMode: Text.Wrap
+                    }
+
+                    ScrollView {
+                        visible: root.certificateDetails !== ""
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: Style.space(220)
+                        clip: true
+
+                        TextArea {
+                            text: root.certificateDetails
+                            color: root.barForeground
+                            readOnly: true
+                            selectByMouse: true
+                            wrapMode: TextEdit.WrapAnywhere
+                            font.family: Style.font.family
+                            font.pixelSize: Style.font.bodySmall
+                            background: null
+                        }
+
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: Style.space(8)
+
+                        Button {
+                            text: "View Certificate"
+                            foreground: root.barForeground
+                            bordered: true
+                            enabled: !root.certificateBusy
+                            onClicked: root.submitCertificateDecision("view")
+                        }
+
+                        Item {
+                            Layout.fillWidth: true
+                        }
+
+                        Button {
+                            text: "Cancel"
+                            foreground: root.barForeground
+                            bordered: true
+                            onClicked: root.submitCertificateDecision("cancel")
+                        }
+
+                        Button {
+                            text: "Accept"
+                            foreground: root.barForeground
+                            bordered: true
+                            enabled: !root.certificateBusy
+                            onClicked: root.submitCertificateDecision("accept")
+                        }
+
+                        Button {
+                            text: root.certificateBusy ? "Working…" : "Always Trust"
+                            iconSpinning: root.certificateBusy
+                            foreground: root.barForeground
+                            accent: Color.accent
+                            selected: true
+                            bordered: true
+                            enabled: !root.certificateBusy
+                            onClicked: root.submitCertificateDecision("always")
+                        }
+
                     }
 
                 }

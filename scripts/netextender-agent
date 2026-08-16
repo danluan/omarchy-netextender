@@ -17,6 +17,7 @@ import select
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -24,6 +25,8 @@ APP = "danluan.netextender"
 PPP_PID = Path("/etc/ppp/netextenderppp.pid")
 CLIENT_PID = Path("/etc/ppp/netextender.pid")
 CLIENT_IP = Path("/etc/ppp/sslvpn.clientip")
+CERT_PROMPT = "do you want to proceed? (y:yes, n:no, v:view certificate)"
+SHA1_RE = re.compile(r"SHA1\s*\[\s*([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){19})\s*\]", re.I)
 
 
 def event(kind: str, **values: object) -> None:
@@ -146,6 +149,101 @@ def has_secret(args: argparse.Namespace) -> int:
     return 0
 
 
+def certificate_warning(transcript: str) -> str:
+    """Return NetExtender's certificate warning without the prompt itself."""
+    normalized = transcript.replace("\r", "")
+    match = re.search(r"Warning:\s*(.*?)\s*Do you want to proceed\?", normalized,
+                      flags=re.I | re.S)
+    if match:
+        return " ".join(match.group(1).split())
+    return "The server certificate could not be verified."
+
+
+def certificate_details(transcript: str) -> str:
+    """Extract the human-readable block printed after the CLI receives V."""
+    normalized = transcript.replace("\r", "")
+    start = re.search(r"Certificate Detail:\s*", normalized, flags=re.I)
+    if not start:
+        return ""
+    details = normalized[start.end():]
+    prompt = re.search(r"Do you want to proceed\?", details, flags=re.I)
+    if prompt:
+        details = details[:prompt.start()]
+    lines = [line.strip() for line in details.splitlines()]
+    return "\n".join(line for line in lines if line).strip()
+
+
+def certificate_fingerprint(details: str) -> str:
+    match = SHA1_RE.search(details)
+    if not match:
+        return ""
+    return "SHA1[" + match.group(1).upper() + "]"
+
+
+def persist_trusted_certificate(server: str, fingerprint: str,
+                                config_path: Path | None = None) -> None:
+    """Atomically pin a certificate using NetExtender's native config format."""
+    if (not server or len(server) > 512 or any(char in server for char in "\r\n=[]")):
+        raise ValueError("invalid NetExtender server key")
+    if not re.fullmatch(r"SHA1\[[0-9A-F]{2}(?::[0-9A-F]{2}){19}\]", fingerprint):
+        raise ValueError("invalid SHA-1 certificate fingerprint")
+
+    path = config_path or (Path.home() / ".netextender")
+    try:
+        original = path.read_text(encoding="utf-8")
+        mode = path.stat().st_mode & 0o777
+    except FileNotFoundError:
+        original = ""
+        mode = 0o600
+
+    lines = original.splitlines(keepends=True)
+    section_start = None
+    section_end = len(lines)
+    for index, line in enumerate(lines):
+        section = re.fullmatch(r"\s*\[([^]]+)\]\s*(?:\r?\n)?", line)
+        if not section:
+            continue
+        if section_start is not None:
+            section_end = index
+            break
+        if section.group(1).lower() == "trustedcerts":
+            section_start = index
+
+    replacement = f"{server}={fingerprint}\n"
+    if section_start is None:
+        if lines and not lines[-1].endswith(("\n", "\r")):
+            lines[-1] += "\n"
+        if lines and lines[-1].strip():
+            lines.append("\n")
+        lines.extend(["[trustedcerts]\n", replacement])
+    else:
+        replaced = False
+        for index in range(section_start + 1, section_end):
+            key, separator, _ = lines[index].partition("=")
+            if separator and key.strip().casefold() == server.casefold():
+                lines[index] = replacement
+                replaced = True
+                break
+        if not replaced:
+            lines.insert(section_end, replacement)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            output.writelines(lines)
+            output.flush()
+            os.fsync(output.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def disconnect() -> int:
     pid = live_pid(CLIENT_PID)
     if not pid:
@@ -180,6 +278,10 @@ def connect(args: argparse.Namespace) -> int:
     password_sent = False
     awaiting_otp = False
     otp_deadline = 0.0
+    awaiting_certificate = False
+    collecting_certificate = False
+    always_trust = False
+    certificate_cancelled = False
     input_open = True
     try:
         while proc.poll() is None:
@@ -191,7 +293,34 @@ def connect(args: argparse.Namespace) -> int:
                     data = ""
                 transcript = (transcript + data)[-8192:]
                 lower = transcript.lower()
-                if not password_sent and "password:" in lower:
+                if CERT_PROMPT in lower:
+                    if certificate_cancelled:
+                        transcript = ""
+                        lower = ""
+                    elif collecting_certificate:
+                        details = certificate_details(transcript)
+                        fingerprint = certificate_fingerprint(details)
+                        event("certificate_details", details=details, fingerprint=fingerprint)
+                        collecting_certificate = False
+                        if always_trust:
+                            try:
+                                persist_trusted_certificate(args.server, fingerprint)
+                                event("certificate_trusted", server=args.server,
+                                      fingerprint=fingerprint)
+                            except (OSError, ValueError) as error:
+                                event("warning", message=(
+                                    "The certificate was accepted for this connection, but "
+                                    f"permanent trust could not be saved: {error}"
+                                ))
+                            os.write(master, b"Y\n")
+                            awaiting_certificate = False
+                            always_trust = False
+                    else:
+                        awaiting_certificate = True
+                        event("needs_certificate", message=certificate_warning(transcript))
+                    transcript = ""
+                    lower = ""
+                if not awaiting_certificate and not password_sent and "password:" in lower:
                     os.write(master, (password + "\n").encode())
                     password = ""
                     password_sent = True
@@ -207,11 +336,33 @@ def connect(args: argparse.Namespace) -> int:
                     event("error", message="Authentication failed. Check your details or verification code.")
                     transcript = ""
             if input_open and sys.stdin in readable:
-                code = sys.stdin.readline().strip()
-                if not code:
+                raw_input = sys.stdin.readline()
+                if raw_input == "":
                     input_open = False
-                elif awaiting_otp:
-                    os.write(master, (code + "\n").encode())
+                    continue
+                response = raw_input.strip()
+                if awaiting_certificate:
+                    if response == "cert:accept":
+                        os.write(master, b"Y\n")
+                        awaiting_certificate = False
+                        transcript = ""
+                        event("certificate_accepted")
+                    elif response == "cert:cancel":
+                        os.write(master, b"N\n")
+                        awaiting_certificate = False
+                        collecting_certificate = False
+                        always_trust = False
+                        certificate_cancelled = True
+                        transcript = ""
+                        event("certificate_cancelled")
+                    elif response in ("cert:view", "cert:always") and not collecting_certificate:
+                        collecting_certificate = True
+                        always_trust = response == "cert:always"
+                        transcript = ""
+                        os.write(master, b"V\n")
+                        event("reading_certificate")
+                elif awaiting_otp and response:
+                    os.write(master, (response + "\n").encode())
                     awaiting_otp = False
                     event("verifying_otp")
             if awaiting_otp and time.monotonic() > otp_deadline:

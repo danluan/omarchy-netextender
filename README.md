@@ -1,86 +1,63 @@
 # NetExtender VPN for Omarchy
 
-An Omarchy bar widget for SonicWall NetExtender. It provides a compact,
-theme-aware connection form, a workspace-persistent two-factor prompt, and
-live session information after login.
+> [!WARNING]
+> This plugin is experimental and under active development. Features and
+> configuration may change, and some NetExtender environments may not yet be
+> supported.
 
-## What it stores
+An Omarchy bar plugin for connecting to SonicWall NetExtender. It provides a
+compact connection form, secure password storage, two-factor authentication,
+certificate verification prompts, and live VPN session information.
 
-| Data | Location |
-| --- | --- |
-| Server, username, domain, recent servers | The plugin entry in Omarchy's `shell.json` |
-| Password | System Secret Service keyring (GNOME Keyring/KWallet), keyed by server + username + domain |
-| 2FA code | Memory only for the active login; never stored |
+## Features
 
-The plugin never passes a password with `netExtender -p`. Its local agent runs
-NetExtender in a private pseudo-terminal and answers its password prompt from
-the keyring. Server, username, and domain are supplied as literal process
-arguments, never through a shell command.
+- Connect and disconnect from the Omarchy bar
+- Store passwords in the desktop Secret Service keyring
+- Handle verification codes without storing them
+- Review, accept, or permanently trust server certificates
+- Display the client IP, PPP interface, traffic, and connection duration
 
 ## Requirements
 
-- Omarchy with its Quickshell bar
-- `/usr/bin/netExtender`
-- `secret-tool` and a working Secret Service provider (normally GNOME Keyring)
-- Python 3 (standard library only)
-- `ip` from `iproute2`
+- Omarchy with the Quickshell bar
+- SonicWall NetExtender CLI at `/usr/bin/netExtender`
+- `secret-tool` with a working Secret Service provider
+- Python 3 and `iproute2`
 
 ## Install
-
-Install from the public repository:
 
 ```bash
 omarchy plugin add https://github.com/danluan/omarchy-netextender.git --enable
 omarchy bar move danluan.netextender --section right --after omarchy.network
 ```
 
-To update an installed copy later:
+## Usage
+
+Open the NetExtender icon in the bar, enter the server, username, password,
+and domain, then select **Connect**. Saved passwords remain in the system
+keyring and are reused on later connections.
+
+If NetExtender cannot verify the server certificate, the plugin lets you view
+its details, accept it for the current connection, reject it, or save its
+fingerprint with **Always Trust**.
+
+Use **Disconnect** to end the VPN session. Right-clicking the bar icon also
+disconnects, while middle-clicking refreshes the displayed status.
+
+## Update
 
 ```bash
 omarchy plugin update danluan.netextender
 ```
 
-## Publishing
+## Data storage
 
-The repository contains only the plugin source: it never contains credentials
-or the proprietary NetExtender client. After creating the GitHub repository,
-publish from this directory with:
+| Data | Location |
+| --- | --- |
+| Server, username, domain, and recent profiles | Omarchy `shell.json` |
+| Password | Desktop Secret Service keyring |
+| Verification code | Memory only; never stored |
+| Permanently trusted certificate | NetExtender `~/.netextender` configuration |
 
-```bash
-gh auth login --web
-git init
-git add README.md LICENSE .gitignore Panel.qml manifest.json scripts/netextender-agent
-git commit -m "Initial release"
-gh repo create omarchy-netextender --public --source=. --remote=origin --push
-```
-
-Open the shield icon in the bar. Enter Server, Username, Password, and Domain,
-then select **Connect**. The password is saved to the desktop keyring as part
-of that action; leave the password box empty on later connections to reuse it.
-
-## Test checklist
-
-1. Open the widget and verify that Server, Username, and Domain remain after
-   closing and reopening it.
-2. Enter a password, connect, and confirm the password field clears. Confirm
-   that no password appears in `shell.json` or in `ps` output.
-3. When the server asks for two-factor authentication, verify that the centered
-   dialog appears on every Hyprland workspace. Enter a code from the authenticator app.
-4. Once connected, confirm the session page shows Client IP, PPP interface,
-   sent data, received data, and duration. The counters come from the active
-   PPP interface rather than the main network interface.
-5. Select **Disconnect**, wait for the state to become Disconnected, and verify
-   the PPP interface is gone. Right-clicking the bar icon also disconnects;
-   middle-click refreshes the status.
-6. Test a wrong password and a wrong 2FA code. The widget should surface the
-   error without retaining either value.
-
-## Troubleshooting
-
-- If saving the password fails, start or unlock a Secret Service provider and
-  retry. `secret-tool` must be able to open a user keyring.
-- The original SonicWall client may phrase the prompt as `One Time Password`,
-  `Enter next token`, or an additional verification prompt. The agent accepts
-  each of these and opens the same 2FA window.
-- For a status issue, run `scripts/netextender-agent status` from this folder.
-  It prints non-sensitive JSON only.
+The plugin does not pass passwords through command-line arguments. Its local
+agent communicates with NetExtender through a private pseudo-terminal.
